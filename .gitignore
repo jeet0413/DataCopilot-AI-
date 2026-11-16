@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Build files
+dist/
+build/
+
+# Uploaded datasets and temporary files
+uploads/
+*.csv
+*.log
+
+# IDE and OS
+.vscode/
+.DS_Store
+Thumbs.db

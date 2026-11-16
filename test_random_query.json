@@ -1,0 +1,5 @@
+{
+  "user_query": "Show me product analysis with pricing and inventory",
+  "table_name": "random_test_data",
+  "user_id": "test-user"
+}
