@@ -19,32 +19,48 @@ A modern SaaS web application for AI-powered data analysis and insights.
 - **Icons**: Lucide React
 - **Routing**: React Router
 
+## Architecture
+
+```
+Browser (React, :3000) -> Express backend (:3002) -> FastAPI AI service (:8001) -> PostgreSQL
+                              |                                                   (schema user_data)
+                              +-> Supabase (users + dataset metadata)
+```
+
+- The browser only talks to the backend and sends a `dataset_id`; the backend checks ownership.
+- The AI service accepts calls only with the shared `X-Internal-Token` secret.
+- Each uploaded CSV becomes its own table `user_data.ds_<uuid>`. Generated SQL is validated
+  (single SELECT, own table only), then run in a read-only transaction with a timeout and row cap.
+
 ## Getting Started
 
-### Prerequisites
+Prerequisites: Node 18+, Python 3.12, a PostgreSQL database, optionally a Supabase project.
 
-- Node.js (v14 or higher)
-- npm or yarn
-
-### Installation
-
-1. Clone the repository:
+1. Run `backend/migrations/001_passwords_and_dataset_tables.sql` in Supabase (after `backend/complete-schema.sql`).
+2. AI service:
 ```bash
-git clone <repository-url>
-cd datacopilot-ai
+cd ai-service
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env      # set DATABASE_URL, AI_SERVICE_TOKEN, optional HUGGINGFACE_API_KEY
+uvicorn app:app --port 8001
 ```
-
-2. Install dependencies:
+3. Backend:
 ```bash
+cd backend
 npm install
+cp .env.example .env      # set JWT_SECRET, AI_SERVICE_TOKEN (same value), SUPABASE_*
+npm start                 # http://localhost:3002
 ```
+Without Supabase configured the backend uses an in-memory user store (development only).
+4. Frontend: `npm install && npm start` (http://localhost:3000). Set `REACT_APP_API_URL` if the backend is elsewhere.
 
-3. Start the development server:
+## Tests
+
 ```bash
-npm start
+cd ai-service && pip install -r requirements-dev.txt && TEST_DATABASE_URL=postgresql://... pytest
+cd backend && TEST_PYTHON=/path/to/python TEST_DATABASE_URL=postgresql://... npm test
 ```
-
-4. Open your browser and navigate to `http://localhost:3000`
 
 ## Project Structure
 
@@ -87,9 +103,7 @@ The application uses a clean, minimal design inspired by modern SaaS products li
 - **Components**: Rounded corners, subtle shadows, smooth animations
 - **Dark Mode**: Full dark theme support
 
-## Mock Data
-
-The application currently uses mock data to demonstrate functionality. The API service (`src/services/api.js`) simulates backend responses with realistic delays and data structures.
+See `DEVELOPMENT_TRACKER.md` for current status, known gaps and the roadmap.
 
 ## Contributing
 
