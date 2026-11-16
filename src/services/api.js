@@ -57,24 +57,22 @@ export const analyzeDataset = async (file) => {
   }
 };
 
-export const processNaturalLanguageQuery = async (userQuery, tableName, userId) => {
+// The backend resolves the dataset (and its owner) from the login token, so only the dataset id is sent.
+export const processNaturalLanguageQuery = async (userQuery, datasetId) => {
   return apiCall('/ai/query', {
     method: 'POST',
     body: JSON.stringify({
       user_query: userQuery,
-      table_name: tableName,
-      user_id: userId,
+      dataset_id: datasetId,
     }),
   });
 };
 
-export const generateInsights = async (tableName, userId, queryResults = null) => {
+export const generateInsights = async (datasetId) => {
   return apiCall('/ai/insights', {
     method: 'POST',
     body: JSON.stringify({
-      table_name: tableName,
-      user_id: userId,
-      query_results: queryResults,
+      dataset_id: datasetId,
     }),
   });
 };
@@ -100,7 +98,11 @@ export const getAIServiceCapabilities = async () => {
 // Dataset operations
 export const fetchDatasets = async () => {
   const response = await authenticatedFetch(`${API_BASE_URL}/datasets`);
-  return await response.json();
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || `HTTP error! status: ${response.status}`);
+  }
+  return data;
 };
 
 export const uploadDataset = async (file) => {
@@ -135,7 +137,11 @@ export const deleteDataset = async (datasetId) => {
   const response = await authenticatedFetch(`${API_BASE_URL}/datasets/${datasetId}`, {
     method: 'DELETE',
   });
-  return await response.json();
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || `HTTP error! status: ${response.status}`);
+  }
+  return data;
 };
 
 // Health check

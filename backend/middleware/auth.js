@@ -1,49 +1,37 @@
-const jwt = require('jsonwebtoken');
+const { verifyToken } = require('../services/jwt');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+function extractToken(req) {
+  const header = req.headers.authorization || req.headers.Authorization;
+  if (!header || typeof header !== 'string') return null;
+  const [scheme, token] = header.split(' ');
+  return scheme && scheme.toLowerCase() === 'bearer' && token ? token : null;
+}
 
-// Authentication middleware
+// Authentication middleware: 401 when no token, 403 when the token is invalid or expired.
 const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-
+  const token = extractToken(req);
   if (!token) {
-    return res.status(401).json({
-      success: false,
-      error: 'Access token required'
-    });
+    return res.status(401).json({ success: false, error: 'Access token required' });
   }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({
-        success: false,
-        error: 'Invalid or expired token'
-      });
-    }
-
-    req.user = user;
-    next();
-  });
+  try {
+    req.user = verifyToken(token);
+    return next();
+  } catch {
+    return res.status(403).json({ success: false, error: 'Invalid or expired token' });
+  }
 };
 
-// Optional authentication (doesn't fail if no token)
+// Optional authentication: sets req.user when a valid token is present, never fails.
 const optionalAuth = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
+  const token = extractToken(req);
   if (token) {
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-      if (!err) {
-        req.user = user;
-      }
-    });
+    try {
+      req.user = verifyToken(token);
+    } catch {
+      // ignore invalid token
+    }
   }
-
   next();
 };
 
-module.exports = {
-  authenticateToken,
-  optionalAuth
-};
+module.exports = { authenticateToken, optionalAuth };

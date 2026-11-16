@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import SkeletonLoader from '../components/SkeletonLoader';
 import EmptyState from '../components/EmptyState';
-import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { TrendingUp, TrendingDown, Brain, Target, AlertTriangle, CheckCircle, BarChart3, RefreshCw, Lightbulb } from 'lucide-react';
 import { fetchDatasets, generateInsights, generateRecommendations } from '../services/api';
-import { useAuth } from '../contexts/AuthContext';
 
 const Insights = () => {
-  const { user } = useAuth();
   const [selectedDataset, setSelectedDataset] = useState('');
   const [loading, setLoading] = useState(true);
   const [datasets, setDatasets] = useState([]);
@@ -24,6 +21,7 @@ const Insights = () => {
     if (selectedDataset) {
       generateDatasetInsights();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDataset]);
 
   const loadDatasets = async () => {
@@ -50,10 +48,7 @@ const Insights = () => {
       setIsGenerating(true);
       
       // Generate insights
-      const insightsResponse = await generateInsights(
-        selectedDataset,
-        user?.id || 'anonymous'
-      );
+      const insightsResponse = await generateInsights(selectedDataset);
       
       if (insightsResponse.success) {
         setInsights(insightsResponse.data);

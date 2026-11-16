@@ -69,11 +69,13 @@ def _llm_meta_log(op: str, llm_result: Optional[LLMResult] = None, state: str = 
 class HuggingFaceLLM:
     """Hugging Face LLM client for Mistral-7B-Instruct-v0.1 via router.huggingface.co"""
 
-    ACTIVE_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"
+    ACTIVE_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.1")
 
     def __init__(self):
         self.api_key = os.getenv("HUGGINGFACE_API_KEY")
-        self.model_url = f"https://router.huggingface.co/models/{self.ACTIVE_MODEL}"
+        # Endpoint is configurable: if the default returns 404/410, set HF_API_URL to
+        # https://router.huggingface.co/v1/chat/completions (OpenAI-compatible route).
+        self.model_url = os.getenv("HF_API_URL") or f"https://router.huggingface.co/models/{self.ACTIVE_MODEL}"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -161,8 +163,11 @@ Schema (use ONLY these columns and tables — do not invent columns):
 
 Rules:
 - Return ONLY SQL — no markdown fences, no explanation.
+- Return exactly ONE read-only SELECT statement. Never use INSERT/UPDATE/DELETE/DDL.
+- Read ONLY from the single table named in the schema, using that exact name with no schema prefix.
 - Use exact column names from the schema above. NEVER invent column names.
 - Use aggregation (SUM/AVG/COUNT/MAX/MIN) when requested.
+- Add LIMIT 1000 to queries that return raw rows.
 - Use proper PostgreSQL syntax.
 - Quote identifiers with double quotes if table/column contains hyphens/special chars.
 - Query results must be reproducible.
@@ -200,34 +205,52 @@ User Query:
     return fallback_sql, meta
 
 
-def generate_fallback_sql(user_query: str, table_schema: str) -> str:
-    """Generate simple SQL using rule-based approach"""
-    query_lower = user_query.lower()
-
-    # Extract table name from schema
+def _parse_schema_text(table_schema: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Return (table_name, [(column, type), ...]) from the 'Table: x / - col: type' schema text."""
     table_name = "your_table"
-    if "Table:" in table_schema:
-        table_name = table_schema.split("Table:")[1].split("\n")[0].strip()
+    columns: List[Tuple[str, str]] = []
+    for line in (table_schema or "").splitlines():
+        line = line.strip()
+        if line.startswith("Table:"):
+            table_name = line.split("Table:", 1)[1].strip()
+        elif line.startswith("- ") and ":" in line:
+            col, _, typ = line[2:].partition(":")
+            columns.append((col.strip(), typ.strip().lower()))
+    return table_name, columns
 
-    # Quote table name if it looks like a UUID or contains special characters
+
+def generate_fallback_sql(user_query: str, table_schema: str) -> str:
+    """Schema-aware rule-based SQL, used only when the LLM is unavailable.
+
+    Only emits SQL over columns that really exist in the schema text.
+    """
+    query_lower = user_query.lower()
+    table_name, columns = _parse_schema_text(table_schema)
     if "-" in table_name or "." in table_name or table_name.isdigit():
         table_name = f'"{table_name}"'
 
-    # Simple pattern matching
-    if ("total" in query_lower and "count" in query_lower) or "number of records" in query_lower:
-        return f"SELECT COUNT(*) as total_records FROM {table_name};"
-    elif "average" in query_lower or "avg" in query_lower:
-        return f"SELECT AVG(*) as average_value FROM {table_name};"
-    elif "maximum" in query_lower or "max" in query_lower:
-        return f"SELECT MAX(*) as maximum_value FROM {table_name};"
-    elif "minimum" in query_lower or "min" in query_lower:
-        return f"SELECT MIN(*) as minimum_value FROM {table_name};"
-    elif "sum" in query_lower:
-        return f"SELECT SUM(*) as total_sum FROM {table_name};"
-    elif "recent" in query_lower or "latest" in query_lower:
-        return f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT 10;"
-    else:
-        return f"SELECT * FROM {table_name} LIMIT 10;"
+    numeric_types = ("integer", "bigint", "numeric", "double", "real", "smallint", "float")
+    numeric_cols = [c for c, t in columns if any(n in t for n in numeric_types)]
+    # Prefer a numeric column the question actually mentions.
+    mentioned = [c for c in numeric_cols if c.lower().replace("_", " ") in query_lower or c.lower() in query_lower]
+    target = (mentioned or numeric_cols or [None])[0]
+
+    def agg(func: str, alias: str) -> str:
+        if target is None:
+            return f"SELECT COUNT(*) AS total_records FROM {table_name}"
+        return f'SELECT {func}("{target}") AS {alias} FROM {table_name}'
+
+    if ("total" in query_lower and "count" in query_lower) or "number of records" in query_lower or "how many" in query_lower or "count" in query_lower:
+        return f"SELECT COUNT(*) AS total_records FROM {table_name}"
+    if "average" in query_lower or "avg" in query_lower or "mean" in query_lower:
+        return agg("AVG", "average_value")
+    if "maximum" in query_lower or "max" in query_lower or "highest" in query_lower:
+        return agg("MAX", "maximum_value")
+    if "minimum" in query_lower or "min" in query_lower or "lowest" in query_lower:
+        return agg("MIN", "minimum_value")
+    if "sum" in query_lower or "total" in query_lower:
+        return agg("SUM", "total_sum")
+    return f"SELECT * FROM {table_name} LIMIT 10"
 
 
 async def fix_sql_error(sql_query: str, error_message: str, table_schema: str = None) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -279,7 +302,13 @@ async def generate_insights_from_data(query_results: List[Dict], user_query: str
     Returns (structured_insights_dict, meta_dict).
     """
     OPERATION = "insights"
-    data_str = json.dumps(query_results, indent=2, default=str)
+    # Keep the prompt bounded: the LLM sees at most PROMPT_ROW_CAP rows; the rule-based
+    # fallback below still computes statistics over every row it is given.
+    PROMPT_ROW_CAP = 100
+    prompt_rows = query_results[:PROMPT_ROW_CAP]
+    data_str = json.dumps(prompt_rows, indent=2, default=str)
+    if len(query_results) > PROMPT_ROW_CAP:
+        data_str += f"\n(showing first {PROMPT_ROW_CAP} of {len(query_results)} rows)"
 
     prompt = f"""You are a data analyst.
 
@@ -742,46 +771,102 @@ def _map_dtype_to_pg(dtype) -> str:
     return "text"
 
 
-def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table_name: str = None) -> Dict[str, Any]:
-    """Read a CSV using pandas and return its profile.
+_RESERVED_WORDS = {
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "both", "case", "cast", "check",
+    "collate", "column", "constraint", "create", "current_date", "current_time", "current_timestamp",
+    "default", "desc", "distinct", "do", "else", "end", "except", "fetch", "for", "foreign", "from",
+    "grant", "group", "having", "in", "initially", "intersect", "into", "leading", "limit", "localtime",
+    "localtimestamp", "not", "null", "offset", "on", "only", "or", "order", "placing", "primary",
+    "references", "returning", "select", "session_user", "some", "symmetric", "table", "then", "to",
+    "trailing", "union", "unique", "user", "using", "variadic", "when", "where", "window", "with",
+}
 
-    Accepts either a file path string or a bytes object of the CSV file contents.
-    Uses ONLY deterministic pandas logic — no LLM.
 
-    Returns:
-        {
-          filename, table_name,
-          row_count, column_count,
-          columns: [name, type_pg, dtype_pandas, nullable, missing_count, unique_count, sample_values[]],
-          numeric_columns, categorical_columns, date_columns,
-          missing_value_counts: {col: n}, unique_value_counts: {col: n},
-          sample_values: {col: [...]},
-          basic_statistics: {numeric_col: {count, mean, min, max, std, median, sum}},
-          schema_text: "Table: <name>\nColumns:\n- col: type\n..." (direct feed to NL→SQL prompt)
-        }
+def sanitize_column_names(columns) -> Tuple[List[str], Dict[str, str]]:
+    """Turn arbitrary CSV headers into safe, unique, snake_case SQL identifiers.
+
+    Returns (new_names, {new_name: original_header}).
     """
-    # Read CSV into DataFrame
-    if isinstance(file_bytes_or_path, (bytes, bytearray)):
-        import io
-        df = pd.read_csv(io.BytesIO(file_bytes_or_path))
-    else:
-        df = pd.read_csv(str(file_bytes_or_path))
+    import re
 
-    # Try to auto-parse date columns
+    new_names: List[str] = []
+    mapping: Dict[str, str] = {}
+    seen: Dict[str, int] = {}
+    for idx, original in enumerate(columns):
+        name = re.sub(r"[^0-9a-zA-Z]+", "_", str(original).strip()).strip("_").lower()
+        if not name:
+            name = f"column_{idx + 1}"
+        if name[0].isdigit():
+            name = f"col_{name}"
+        if name in _RESERVED_WORDS:
+            name = f"{name}_"
+        name = name[:60]
+        base = name
+        n = seen.get(base, 0)
+        while name in mapping:
+            n += 1
+            name = f"{base[:55]}_{n}"
+        seen[base] = n
+        mapping[name] = str(original)
+        new_names.append(name)
+    return new_names, mapping
+
+
+def _maybe_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert text columns that are mostly dates into datetime columns."""
+    import warnings
+
     for col in df.columns:
-        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-            try:
-                parsed = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
-                # If >= 70% parsed non-null → treat as date column
-                if parsed.notna().sum() >= max(1, int(0.7 * len(df))):
-                    df[col] = parsed
-            except Exception:
-                pass
+        series = df[col]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+        non_null = series.dropna().astype(str)
+        if non_null.empty:
+            continue
+        sample = non_null.head(50)
+        # Cheap guard: every sampled value must contain a digit and a date-ish separator.
+        if not sample.str.contains(r"\d").all() or not sample.str.contains(r"[-/:.]|\s").all():
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                parsed = pd.to_datetime(series, errors="coerce")
+            if parsed.notna().sum() >= max(1, int(0.7 * len(non_null))):
+                df[col] = parsed
+        except Exception:  # noqa: BLE001
+            continue
+    return df
 
-    if not table_name:
-        base = os.path.splitext(os.path.basename(filename))[0].lower()
-        table_name = "".join(c if c.isalnum() or c == "_" else "_" for c in base) or "uploaded_data"
 
+def load_csv_dataframe(file_bytes_or_path) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Read CSV bytes/path into a DataFrame with sanitized column names.
+
+    Returns (df, {sanitized_name: original_header}).
+    """
+    import io
+
+    def _read(source):
+        return pd.read_csv(source, skipinitialspace=True)
+
+    if isinstance(file_bytes_or_path, (bytes, bytearray)):
+        try:
+            df = _read(io.BytesIO(file_bytes_or_path))
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(file_bytes_or_path), skipinitialspace=True, encoding="latin-1")
+    else:
+        df = _read(str(file_bytes_or_path))
+
+    if df.shape[1] == 0:
+        raise pd.errors.EmptyDataError("CSV has no columns")
+    new_names, mapping = sanitize_column_names(list(df.columns))
+    df.columns = new_names
+    df = _maybe_parse_dates(df)
+    return df, mapping
+
+
+def profile_dataframe(df: pd.DataFrame, filename: str, table_name: str, column_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Deterministic pandas profile of a DataFrame (no LLM involved)."""
+    column_map = column_map or {}
     row_count = int(len(df))
     column_count = int(df.shape[1])
     col_names = list(df.columns)
@@ -798,15 +883,13 @@ def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table
     for col in col_names:
         series = df[col]
         dtype_pg = _map_dtype_to_pg(series.dtype)
-        is_numeric = pd.api.types.is_numeric_dtype(series)
+        is_numeric = pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
         is_datetime = pd.api.types.is_datetime64_any_dtype(series)
         missing_count = int(series.isna().sum())
         missing_ratio = missing_count / row_count if row_count > 0 else 0.0
 
-        # Safe sample values
-        n_sample = min(5, row_count)
         sample_values = []
-        for v in series.dropna().head(n_sample).tolist():
+        for v in series.dropna().head(min(5, row_count)).tolist():
             if isinstance(v, (pd.Timestamp, datetime, date)):
                 sample_values.append(v.isoformat() if hasattr(v, "isoformat") else str(v))
             elif isinstance(v, (np.integer,)):
@@ -818,31 +901,27 @@ def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table
             else:
                 sample_values.append(str(v) if not isinstance(v, (int, float, bool, str)) else v)
 
-        # Unique value count (for non-missing only)
         unique_count = int(series.dropna().nunique())
         unique_value_counts[col] = unique_count
         missing_value_counts[col] = missing_count
         sample_values_map[col] = sample_values
 
-        nullable = missing_count > 0
-
         columns_meta.append({
             "name": col,
+            "original_name": column_map.get(col, col),
             "type_pg": dtype_pg,
             "dtype_pandas": str(series.dtype),
-            "nullable": nullable,
+            "nullable": missing_count > 0,
             "missing_count": missing_count,
             "missing_ratio": round(missing_ratio, 4),
             "unique_count": unique_count,
             "sample_values": sample_values,
         })
 
-        # Bucket columns
         if is_datetime:
             date_columns.append(col)
         elif is_numeric:
             numeric_columns.append(col)
-            # Stats (skip NaN)
             clean = series.dropna()
             if len(clean) > 0:
                 basic_statistics[col] = {
@@ -855,14 +934,19 @@ def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table
                     "sum": round(float(clean.sum()), 4),
                 }
         else:
-            # Object / string / category
             categorical_columns.append(col)
 
-    # Build NL→SQL-ready schema text (direct feed to prompts)
+    # NL->SQL-ready schema text: physical table + sanitized columns the table really has.
     schema_lines = [f"Table: {table_name}", "Columns:"]
     for c in columns_meta:
         schema_lines.append(f"- {c['name']}: {c['type_pg']}")
     schema_text = "\n".join(schema_lines) + "\n"
+
+    preview_df = df.head(5).copy()
+    for col in preview_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(preview_df[col]):
+            preview_df[col] = preview_df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+    preview_rows = json.loads(preview_df.to_json(orient="records", date_format="iso"))
 
     return {
         "filename": filename,
@@ -877,5 +961,19 @@ def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table
         "unique_value_counts": unique_value_counts,
         "sample_values": sample_values_map,
         "basic_statistics": basic_statistics,
+        "preview_rows": preview_rows,
         "schema_text": schema_text,
     }
+
+
+def process_uploaded_csv(file_bytes_or_path, filename: str = "upload.csv", table_name: str = None) -> Dict[str, Any]:
+    """Read a CSV with pandas and return its profile (no database writes).
+
+    Kept for backwards compatibility; /ingest uses load_csv_dataframe + profile_dataframe
+    so the same DataFrame that was profiled is what gets stored.
+    """
+    df, mapping = load_csv_dataframe(file_bytes_or_path)
+    if not table_name:
+        base = os.path.splitext(os.path.basename(filename))[0].lower()
+        table_name = "".join(c if c.isalnum() or c == "_" else "_" for c in base) or "uploaded_data"
+    return profile_dataframe(df, filename, table_name, mapping)

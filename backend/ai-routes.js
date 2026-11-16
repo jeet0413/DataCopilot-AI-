@@ -1,228 +1,129 @@
 const express = require('express');
 const multer = require('multer');
-const axios = require('axios');
-const FormData = require('form-data');
+const { authenticateToken } = require('./middleware/auth');
+const { rateLimit } = require('./middleware/rateLimit');
+const { getStore, isUuid } = require('./services/store');
+const ai = require('./services/aiClient');
+
 const router = express.Router();
 
-// AI Service Configuration
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8001';
+// Every AI route requires a logged-in user. Datasets are always resolved from the caller's own
+// records: the browser sends a dataset_id, never a table name or user id.
+router.use(authenticateToken);
 
-// Configure multer for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+// LLM calls are slow and cost money; cap them per user rather than per IP.
+router.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.AI_RATE_LIMIT_PER_MINUTE) || 30,
+  keyFn: (req) => `ai:${req.user.userId}`,
+}));
 
-// Helper function to call AI service
-async function callAIService(endpoint, data = null, file = null) {
-  try {
-    let config = {
-      method: 'POST',
-      url: `${AI_SERVICE_URL}${endpoint}`,
-    };
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
 
-    if (file) {
-      const formData = new FormData();
-      formData.append('file', file.buffer, {
-        filename: file.originalname,
-        contentType: file.mimetype
-      });
-      config.data = formData;
-      config.headers = formData.getHeaders();
-    } else if (data) {
-      config.data = data;
-      config.headers = { 'Content-Type': 'application/json' };
-    }
-
-    const response = await axios(config);
-    return response.data;
-  } catch (error) {
-    console.error('AI Service Error:', error.response?.data || error.message);
-    throw new Error(error.response?.data?.detail || 'AI service unavailable');
+function sendError(res, error, fallbackMessage) {
+  if (error instanceof ai.AIServiceError) {
+    const status = error.status >= 400 && error.status < 600 ? error.status : 502;
+    return res.status(status).json({ success: false, error: error.message });
   }
+  console.error(`${fallbackMessage}:`, error.message);
+  return res.status(500).json({ success: false, error: fallbackMessage });
 }
 
-// Route: Analyze uploaded CSV file
+async function loadOwnedDataset(req, res) {
+  const datasetId = req.body && (req.body.dataset_id || req.body.datasetId);
+  if (!isUuid(datasetId)) {
+    res.status(400).json({ success: false, error: 'dataset_id is required' });
+    return null;
+  }
+  const dataset = await getStore().datasets.get(datasetId, req.user.userId);
+  if (!dataset || !dataset.table_name) {
+    res.status(404).json({ success: false, error: 'Dataset not found' });
+    return null;
+  }
+  return dataset;
+}
+
+// POST /api/ai/analyze - profile a CSV without saving it (preview before upload)
 router.post('/analyze', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    console.log('Analyzing file:', req.file.originalname);
-
-    // Call AI service to process the CSV
-    const analysis = await callAIService('/process-data', null, req.file);
-
-    res.json({
-      success: true,
-      data: analysis,
-      message: 'File analyzed successfully'
-    });
+    if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
+    const analysis = await ai.profileOnly(req.file.buffer, req.file.originalname);
+    res.json({ success: true, data: analysis, message: 'File analyzed successfully' });
   } catch (error) {
-    console.error('Analysis error:', error);
-    res.status(500).json({ 
-      error: 'Failed to analyze file',
-      details: error.message 
-    });
+    sendError(res, error, 'Failed to analyze file');
   }
 });
 
-// Route: Process natural language query
+// POST /api/ai/query  { dataset_id, user_query }
 router.post('/query', async (req, res) => {
   try {
-    const { user_query, table_name, user_id } = req.body;
-
-    if (!user_query || !table_name || !user_id) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: user_query, table_name, user_id' 
-      });
+    const userQuery = req.body && req.body.user_query;
+    if (typeof userQuery !== 'string' || !userQuery.trim()) {
+      return res.status(400).json({ success: false, error: 'user_query is required' });
     }
+    if (userQuery.length > 1000) {
+      return res.status(400).json({ success: false, error: 'Question is too long (max 1000 characters)' });
+    }
+    const dataset = await loadOwnedDataset(req, res);
+    if (!dataset) return;
 
-    console.log(`Processing query: "${user_query}" for table: ${table_name}`);
-
-    // Call AI service to process the query
-    const result = await callAIService('/query', {
-      user_query,
-      table_name,
-      user_id
+    const result = await ai.query({
+      user_query: userQuery.trim(),
+      table_name: dataset.table_name,
+      user_id: req.user.userId,
+      table_schema_text: dataset.profile && dataset.profile.schema_text,
     });
-
-    res.json({
-      success: true,
-      data: result,
-      message: 'Query processed successfully'
-    });
+    // Do not leak the physical table name to the browser.
+    const { schema_used, ...safe } = result;
+    res.json({ success: true, data: { ...safe, dataset_id: dataset.id }, message: 'Query processed successfully' });
   } catch (error) {
-    console.error('Query processing error:', error);
-    res.status(500).json({ 
-      error: 'Failed to process query',
-      details: error.message 
-    });
+    sendError(res, error, 'Failed to process query');
   }
 });
 
-// Route: Generate insights
+// POST /api/ai/insights  { dataset_id }
 router.post('/insights', async (req, res) => {
   try {
-    const { table_name, user_id, query_results } = req.body;
-
-    if (!table_name || !user_id) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: table_name, user_id' 
-      });
-    }
-
-    console.log(`Generating insights for table: ${table_name}`);
-
-    // Call AI service to generate insights
-    const insights = await callAIService('/generate-insights', {
-      table_name,
-      user_id,
-      query_results
-    });
-
-    res.json({
-      success: true,
-      data: insights,
-      message: 'Insights generated successfully'
-    });
+    const dataset = await loadOwnedDataset(req, res);
+    if (!dataset) return;
+    const insights = await ai.insights({ table_name: dataset.table_name, user_id: req.user.userId });
+    res.json({ success: true, data: insights, message: 'Insights generated successfully' });
   } catch (error) {
-    console.error('Insights generation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate insights',
-      details: error.message 
-    });
+    sendError(res, error, 'Failed to generate insights');
   }
 });
 
-// Route: Generate business recommendations
+// POST /api/ai/recommendations  { insights, business_context? }
 router.post('/recommendations', async (req, res) => {
   try {
-    const { insights, business_context } = req.body;
-
-    if (!insights) {
-      return res.status(400).json({ 
-        error: 'Missing required field: insights' 
-      });
-    }
-
-    console.log('Generating business recommendations');
-
-    // Call AI service to generate recommendations
-    const recommendations = await callAIService('/recommendations', {
-      insights,
-      business_context
-    });
-
-    res.json({
-      success: true,
-      data: recommendations,
-      message: 'Recommendations generated successfully'
-    });
+    const { insights, business_context } = req.body || {};
+    if (!insights) return res.status(400).json({ success: false, error: 'insights is required' });
+    const recommendations = await ai.recommendations({ insights, business_context });
+    res.json({ success: true, data: recommendations, message: 'Recommendations generated successfully' });
   } catch (error) {
-    console.error('Recommendations generation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate recommendations',
-      details: error.message 
-    });
+    sendError(res, error, 'Failed to generate recommendations');
   }
 });
 
-// Route: Health check for AI service
+// GET /api/ai/health
 router.get('/health', async (req, res) => {
   try {
-    const response = await axios.get(`${AI_SERVICE_URL}/`);
-    res.json({
-      success: true,
-      ai_service_status: 'healthy',
-      ai_service_response: response.data
-    });
+    const status = await ai.health();
+    res.json({ success: true, ai_service_status: status.status, database: status.database, llm_configured: status.llm_configured });
   } catch (error) {
-    res.status(503).json({
-      success: false,
-      ai_service_status: 'unhealthy',
-      error: 'AI service is not accessible'
-    });
+    res.status(503).json({ success: false, ai_service_status: 'unhealthy', error: 'AI service is not accessible' });
   }
 });
 
-// Route: Get AI service capabilities
-router.get('/capabilities', async (req, res) => {
-  try {
-    const capabilities = {
-      supported_operations: [
-        'csv_analysis',
-        'natural_language_to_sql',
-        'insight_generation',
-        'recommendation_engine'
-      ],
+router.get('/capabilities', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      supported_operations: ['csv_analysis', 'natural_language_to_sql', 'insight_generation', 'recommendation_engine'],
       supported_file_types: ['csv'],
-      query_types: [
-        'count_queries',
-        'aggregation_queries',
-        'trend_analysis',
-        'data_quality_checks'
-      ],
-      ai_features: [
-        'column_detection',
-        'data_type_inference',
-        'missing_value_analysis',
-        'basic_statistics',
-        'outlier_detection',
-        'trend_detection',
-        'business_recommendations'
-      ]
-    };
-
-    res.json({
-      success: true,
-      data: capabilities
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get capabilities'
-    });
-  }
+      max_file_size_mb: 10,
+    },
+  });
 });
 
 module.exports = router;

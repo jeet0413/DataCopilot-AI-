@@ -2,18 +2,16 @@ import React, { useState, useEffect } from 'react';
 import ChatBox from '../components/ChatBox';
 import SkeletonLoader from '../components/SkeletonLoader';
 import EmptyState from '../components/EmptyState';
-import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
-import { Database, Lightbulb, TrendingUp, Users, Play, Table, BarChart3, MessageSquare, AlertTriangle, CheckCircle } from 'lucide-react';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
+import { Database, Lightbulb, TrendingUp, Table, BarChart3, MessageSquare, AlertTriangle, CheckCircle } from 'lucide-react';
 import { fetchDatasets, processNaturalLanguageQuery } from '../services/api';
-import { useAuth } from '../contexts/AuthContext';
 
 const Query = () => {
-  const { user } = useAuth();
   const [selectedDataset, setSelectedDataset] = useState('');
   const [loading, setLoading] = useState(true);
   const [datasets, setDatasets] = useState([]);
   const [recentQueries, setRecentQueries] = useState([]);
-  const [currentQuery, setCurrentQuery] = useState('');
+  const [, setCurrentQuery] = useState('');
   const [queryResult, setQueryResult] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState('chat'); // 'chat', 'results', 'insights', 'chart'
@@ -63,11 +61,7 @@ const Query = () => {
       setIsProcessing(true);
       setCurrentQuery(query);
       
-      const response = await processNaturalLanguageQuery(
-        query,
-        selectedDataset,
-        user?.id || 'anonymous'
-      );
+      const response = await processNaturalLanguageQuery(query, selectedDataset);
       
       if (response.success) {
         setQueryResult(response.data);
@@ -83,7 +77,9 @@ const Query = () => {
           results: response.data.data || response.data.results || []
         };
         setRecentQueries(prev => [newQuery, ...prev.slice(0, 4)]); // Keep last 5
+        return response.data;
       }
+      return { error: response.error || 'Query failed' };
     } catch (error) {
       console.error('Error processing query:', error);
       // Show error in chat
@@ -92,6 +88,7 @@ const Query = () => {
         sql_query: 'Error occurred',
         results: []
       });
+      return { error: error.message };
     } finally {
       setIsProcessing(false);
     }
