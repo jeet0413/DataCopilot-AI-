@@ -38,7 +38,7 @@ questions by generating **safe** SQL, runs it, and returns tables, charts and in
 ## 5. Known bugs / risks
 - HF endpoint (`HF_API_URL`) may be outdated; configurable, falls back to rules.
 - In-memory store loses data on restart (dev only; refused in production).
-- Unused legacy: `backend/services/{database,supabase,supabase-fallback}.js`, `ai-service/app_backup.py`, `app_fixed.py`, `src/services/api-mock.js`, stale root `*.md` reports.
+- Legacy mock/fallback services and stale report files were removed (see git history).
 
 ## 6. Architectural decisions
 1. Backend is the only AI-service client (shared `X-Internal-Token`); browser sends only `dataset_id`.
