@@ -10,6 +10,8 @@ const Upload = () => {
   const [files, setFiles] = useState([]);
   const [uploadProgress, setUploadProgress] = useState({});
   const [uploadStatus, setUploadStatus] = useState({});
+  const [uploadErrors, setUploadErrors] = useState({});
+  const [uploadResults, setUploadResults] = useState({});
   const [processingFiles, setProcessingFiles] = useState(new Set());
   const fileInputRef = useRef(null);
   const navigate = useNavigate();
@@ -60,6 +62,7 @@ const Upload = () => {
     // Start real upload process
     newFiles.forEach(file => {
       setUploadStatus(prev => ({ ...prev, [file.name]: 'uploading' }));
+      setUploadErrors(prev => { const next = { ...prev }; delete next[file.name]; return next; });
       uploadFile(file);
     });
   };
@@ -83,6 +86,7 @@ const Upload = () => {
       
       if (response.success) {
         setUploadProgress(prev => ({ ...prev, [file.name]: 100 }));
+        setUploadResults(prev => ({ ...prev, [file.name]: response.data }));
         setUploadStatus(prev => ({ ...prev, [file.name]: 'completed' }));
         
         // Redirect to dashboard after successful upload
@@ -95,6 +99,7 @@ const Upload = () => {
     } catch (error) {
       console.error('Upload error:', error);
       setUploadStatus(prev => ({ ...prev, [file.name]: 'error' }));
+      setUploadErrors(prev => ({ ...prev, [file.name]: error.message || 'Upload failed' }));
     } finally {
       setProcessingFiles(prev => {
         const newSet = new Set(prev);
@@ -122,14 +127,10 @@ const Upload = () => {
     fileInputRef.current?.click();
   };
 
+  // Real preview rows returned by the server after the file was analysed.
   const getFilePreview = (file) => {
-    // Mock preview data
-    const mockData = [
-      { id: 1, name: 'John Doe', email: 'john@example.com', value: 1500 },
-      { id: 2, name: 'Jane Smith', email: 'jane@example.com', value: 2300 },
-      { id: 3, name: 'Bob Johnson', email: 'bob@example.com', value: 1800 },
-    ];
-    return mockData;
+    const result = uploadResults[file.name];
+    return result && Array.isArray(result.preview_rows) ? result.preview_rows.slice(0, 3) : [];
   };
 
   return (
@@ -252,11 +253,17 @@ const Upload = () => {
                   </div>
                 )}
 
+                {status === 'error' && uploadErrors[file.name] && (
+                  <p className="mt-2 text-sm text-red-600 dark:text-red-400">
+                    {uploadErrors[file.name]}
+                  </p>
+                )}
+
                 {/* Preview Table */}
-                {status === 'completed' && (
+                {status === 'completed' && previewData.length > 0 && (
                   <div className="mt-4 animate-fade-in">
                     <h5 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                      Preview (first 3 rows)
+                      Preview (first 3 rows) - {uploadResults[file.name].row_count} rows, {uploadResults[file.name].column_count} columns
                     </h5>
                     <div className="overflow-x-auto">
                       <table className="min-w-full text-sm">
@@ -283,7 +290,7 @@ const Upload = () => {
                                   key={`cell-${index}-${cellIndex}`}
                                   className="py-2 px-3 text-gray-600 dark:text-gray-400"
                                 >
-                                  {value}
+                                  {value === null || value === undefined ? '' : String(value)}
                                 </td>
                               ))}
                             </tr>

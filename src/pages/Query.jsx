@@ -2,18 +2,16 @@ import React, { useState, useEffect } from 'react';
 import ChatBox from '../components/ChatBox';
 import SkeletonLoader from '../components/SkeletonLoader';
 import EmptyState from '../components/EmptyState';
-import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
-import { Database, Lightbulb, TrendingUp, Users, Play, Table, BarChart3, MessageSquare, AlertTriangle, CheckCircle } from 'lucide-react';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
+import { Database, Lightbulb, TrendingUp, Table, BarChart3, MessageSquare, AlertTriangle, CheckCircle } from 'lucide-react';
 import { fetchDatasets, processNaturalLanguageQuery } from '../services/api';
-import { useAuth } from '../contexts/AuthContext';
 
 const Query = () => {
-  const { user } = useAuth();
   const [selectedDataset, setSelectedDataset] = useState('');
   const [loading, setLoading] = useState(true);
   const [datasets, setDatasets] = useState([]);
   const [recentQueries, setRecentQueries] = useState([]);
-  const [currentQuery, setCurrentQuery] = useState('');
+  const [, setCurrentQuery] = useState('');
   const [queryResult, setQueryResult] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeTab, setActiveTab] = useState('chat'); // 'chat', 'results', 'insights', 'chart'
@@ -63,11 +61,7 @@ const Query = () => {
       setIsProcessing(true);
       setCurrentQuery(query);
       
-      const response = await processNaturalLanguageQuery(
-        query,
-        selectedDataset,
-        user?.id || 'anonymous'
-      );
+      const response = await processNaturalLanguageQuery(query, selectedDataset);
       
       if (response.success) {
         setQueryResult(response.data);
@@ -83,7 +77,9 @@ const Query = () => {
           results: response.data.data || response.data.results || []
         };
         setRecentQueries(prev => [newQuery, ...prev.slice(0, 4)]); // Keep last 5
+        return response.data;
       }
+      return { error: response.error || 'Query failed' };
     } catch (error) {
       console.error('Error processing query:', error);
       // Show error in chat
@@ -92,6 +88,7 @@ const Query = () => {
         sql_query: 'Error occurred',
         results: []
       });
+      return { error: error.message };
     } finally {
       setIsProcessing(false);
     }
@@ -566,6 +563,22 @@ const Query = () => {
 
               {/* Tab Content */}
               <div className="p-6">
+                {queryResult && activeTab !== 'chat' && (
+                  <div className="mb-4 space-y-2">
+                    {(queryResult.warnings || []).map((w, i) => (
+                      <div key={i} className="flex items-start gap-2 p-3 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 text-sm text-yellow-800 dark:text-yellow-200">
+                        <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                        <span>{w}</span>
+                      </div>
+                    ))}
+                    {queryResult.sql_query && (
+                      <details className="text-sm text-gray-600 dark:text-gray-300">
+                        <summary className="cursor-pointer">SQL that was run</summary>
+                        <pre className="mt-2 p-3 bg-gray-100 dark:bg-gray-900 rounded overflow-x-auto whitespace-pre-wrap break-words">{queryResult.sql_query}</pre>
+                      </details>
+                    )}
+                  </div>
+                )}
                 {activeTab === 'chat' ? (
                   <ChatBox
                     onQuerySubmit={handleQuerySubmit}

@@ -1,67 +1,81 @@
 """
 AI Data Analyst Copilot Service
-Natural Language to SQL conversion with insights generation
+Natural Language to SQL conversion with insights generation.
+
+Security model
+  * The Node backend is the only intended client. Every endpoint except / and /health
+    requires the shared secret in the X-Internal-Token header (AI_SERVICE_TOKEN).
+  * The backend decides which dataset a user may query; this service only touches
+    dataset tables named ds_<32 hex> inside the `user_data` schema.
+  * All generated SQL is validated (sql_safety.py) and executed read-only with a
+    timeout and a row cap (data_store.py).
 """
 
-import os
+import hmac
 import logging
-from typing import Dict, Any, List, Optional, Union
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
-from sqlalchemy import create_engine, text
-import pandas as pd
+import os
 import time
-import json
-from dotenv import load_dotenv
+from typing import Any, Dict, List, Optional, Union
 
-# Import LLM utilities
-from llm_utils import (
-    generate_sql_from_query,
-    fix_sql_error,
-    generate_insights_from_data,
-    generate_recommendations_from_insights,
+import pandas as pd
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+
+load_dotenv()
+
+import data_store  # noqa: E402  (after load_dotenv so env is populated)
+from llm_utils import (  # noqa: E402
+    _maybe_parse_dates,
     detect_chart_type,
+    extract_insights_text,
+    fix_sql_error,
     flatten_recommendations,
     generate_fallback_recommendations_structured,
-    extract_insights_text,
+    generate_insights_from_data,
+    generate_recommendations_from_insights,
+    generate_sql_from_query,
+    load_csv_dataframe,
     process_uploaded_csv,
+    profile_dataframe,
 )
+from sql_safety import UnsafeSQLError, is_valid_table_name  # noqa: E402
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_CSV_ROWS = int(os.getenv("MAX_CSV_ROWS", "500000"))
+MAX_CSV_COLUMNS = int(os.getenv("MAX_CSV_COLUMNS", "200"))
+MAX_INSIGHT_INPUT_ROWS = 5000
 
-# Initialize FastAPI app
-app = FastAPI(title="AI Data Analyst Service", version="1.2.0")
+app = FastAPI(title="AI Data Analyst Service", version="2.0.0")
 
-# CORS middleware
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The browser never calls this service directly (the Node backend proxies it), so CORS is
+# closed unless origins are listed explicitly.
+_allowed_origins = [o.strip() for o in os.getenv("AI_SERVICE_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-# Database connection
-DATABASE_URL = os.getenv("SUPABASE_URL", "postgresql://postgres:password@localhost:5432/postgres")
-engine = None
-use_mock_db = False
 
-try:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-    # Test connection
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    print("✅ Database connected successfully")
-except Exception as e:
-    print(f"⚠️ Database connection failed: {e}")
-    print("🔄 Using mock data for demonstration")
-    use_mock_db = True
+async def require_internal_token(x_internal_token: Optional[str] = Header(default=None)) -> None:
+    """Shared-secret check between the Node backend and this service."""
+    expected = os.getenv("AI_SERVICE_TOKEN", "")
+    if not expected:
+        if os.getenv("AI_SERVICE_ALLOW_UNAUTHENTICATED", "").lower() == "true":
+            return  # explicit local-development opt-out
+        raise HTTPException(status_code=503, detail="AI service is not configured: set AI_SERVICE_TOKEN.")
+    if not x_internal_token or not hmac.compare_digest(x_internal_token.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Invalid or missing service token.")
+
 
 # ============================================================
 # Request/Response Models
@@ -73,11 +87,13 @@ class MetaInfo(BaseModel):
     raw_response_excerpt: Optional[str] = None
     fallback_reason: Optional[str] = None
 
+
 class QueryRequest(BaseModel):
-    user_query: str
-    table_name: str
-    user_id: Optional[str] = None
-    table_schema_text: Optional[str] = None  # If set → use this schema instead of probing DB/mock (direct output from /process-data)
+    user_query: str = Field(..., min_length=1, max_length=1000)
+    table_name: str  # physical dataset table, ds_<32 hex> (resolved by the backend, never by the client)
+    user_id: Optional[str] = None  # informational / logging only
+    table_schema_text: Optional[str] = None  # schema from /ingest; re-read from the database if omitted
+
 
 class QueryResponse(BaseModel):
     sql_query: str
@@ -87,19 +103,23 @@ class QueryResponse(BaseModel):
     recommendations: List[str]
     execution_time: float
     row_count: int
-    # Evidence / provenance
     sql_generation_meta: Dict[str, Any]
     sql_correction_attempts: int = 0
     sql_correction_meta: List[Dict[str, Any]] = []
     insights_meta: Dict[str, Any]
     recommendations_meta: Dict[str, Any]
-    chart_type: str  # Redundant convenience for frontend
+    chart_type: str
     schema_used: str
+    warnings: List[str] = []
+    used_fallback_preview: bool = False
+    truncated: bool = False
+
 
 class InsightRequest(BaseModel):
     table_name: str
     user_id: Optional[str] = None
     query_results: Optional[List[Dict]] = None
+
 
 class InsightResponse(BaseModel):
     insights: List[Dict[str, Any]]
@@ -107,30 +127,33 @@ class InsightResponse(BaseModel):
     anomalies: List[Dict[str, Any]] = []
     meta: Dict[str, Any]
 
+
 class RecommendationRequest(BaseModel):
-    # Accept flexible shapes via Union — the endpoint handler will normalize into standard form:
-    #   Standard: {"insights": [...], "trends": [...], "anomalies": [...]}  (dict wrapper)
-    #   Legacy A: raw list of insight dicts [{"type":..., "description":...}, ...]
-    #   Legacy B: single insights list without trends/anomalies wrapper from frontend's old code
+    # Accepts the standard {"insights": [...], "trends": [...], "anomalies": [...]} wrapper
+    # or a bare list of insight dicts (legacy frontend shape).
     insights: Union[
         Dict[str, List[Dict[str, Any]]],
         List[Dict[str, Any]],
-        Dict[str, Any]
+        Dict[str, Any],
     ]
     business_context: Optional[str] = "general business analysis"
+
 
 class RecommendationItem(BaseModel):
     category: str
     icon: Optional[str] = "target"
     items: List[str]
 
+
 class RecommendationResponse(BaseModel):
     recommendations: List[RecommendationItem]
     action_items: List[str] = []
     meta: Dict[str, Any]
 
+
 class DatasetColumnInfo(BaseModel):
     name: str
+    original_name: Optional[str] = None
     type_pg: str
     dtype_pandas: str
     nullable: bool
@@ -138,6 +161,7 @@ class DatasetColumnInfo(BaseModel):
     missing_ratio: float
     unique_count: int
     sample_values: List[Any]
+
 
 class DatasetProcessingResponse(BaseModel):
     filename: str
@@ -152,197 +176,200 @@ class DatasetProcessingResponse(BaseModel):
     unique_value_counts: Dict[str, int]
     sample_values: Dict[str, List[Any]]
     basic_statistics: Dict[str, Dict[str, float]]
-    schema_text: str  # Direct input to NL→SQL prompt
+    preview_rows: List[Dict[str, Any]] = []
+    schema_text: str  # direct input to the NL->SQL prompt
+
 
 # ============================================================
-# Helper functions
+# Helpers
 # ============================================================
-def get_mock_data(table_name: str):
-    """Return mock data for demonstration"""
-    if table_name == "datasets":
-        return [
-            {"id": "mock-1", "name": "Sample Sales Data", "file_name": "sales.csv", "rows": 1000, "columns": 5},
-            {"id": "mock-2", "name": "Customer Data", "file_name": "customers.csv", "rows": 500, "columns": 4}
-        ]
-    elif table_name == "66367cec-9204-4405-90ce-ef5150209ccd":
-        return [
-            {"id": 1, "product": "Laptop", "price": 999.99, "category": "Electronics", "sales": 45},
-            {"id": 2, "product": "Mouse", "price": 29.99, "category": "Electronics", "sales": 120},
-            {"id": 3, "product": "Keyboard", "price": 79.99, "category": "Electronics", "sales": 85},
-            {"id": 4, "product": "Monitor", "price": 299.99, "category": "Electronics", "sales": 60},
-            {"id": 5, "product": "Desk Chair", "price": 199.99, "category": "Furniture", "sales": 30}
-        ]
-    elif table_name == "test-data" or table_name == "test_data":
-        return [
-            {"name": "John Doe", "email": "john@example.com", "age": 25},
-            {"name": "Jane Smith", "email": "jane@example.com", "age": 30},
-            {"name": "Bob Johnson", "email": "bob@example.com", "age": 35}
-        ]
-    elif table_name == "random_test_data":
-        return [
-            {"product": "Laptop", "category": "Electronics", "price": 999.99, "quantity": 50, "discount": 10},
-            {"product": "Mouse", "category": "Electronics", "price": 29.99, "quantity": 200, "discount": 5},
-            {"product": "Keyboard", "category": "Electronics", "price": 79.99, "quantity": 100, "discount": 15},
-            {"product": "Monitor", "category": "Electronics", "price": 299.99, "quantity": 75, "discount": 8},
-            {"product": "Desk Chair", "category": "Furniture", "price": 199.99, "quantity": 40, "discount": 20},
-            {"product": "Coffee Table", "category": "Furniture", "price": 149.99, "quantity": 25, "discount": 10},
-            {"product": "Bookshelf", "category": "Furniture", "price": 89.99, "quantity": 30, "discount": 12},
-            {"product": "Lamp", "category": "Furniture", "price": 49.99, "quantity": 60, "discount": 8}
-        ]
-    return []
+def _require_valid_table(table_name: str) -> None:
+    if not is_valid_table_name(table_name):
+        raise HTTPException(status_code=422, detail="Invalid dataset table name.")
 
 
-def _build_mock_schema_text(table_name: str, rows: List[Dict[str, Any]] = None) -> str:
-    """Given mock data rows (or fallback to default), build a schema_text compatible with NL→SQL prompt."""
-    if not rows:
-        rows = get_mock_data(table_name) or []
-    if not rows:
-        return f"Table: {table_name}\nColumns:\n"
-    cols = list(rows[0].keys())
-    lines = [f"Table: {table_name}", "Columns:"]
-    for c in cols:
-        sample_val = next((r.get(c) for r in rows if r.get(c) is not None), None)
-        if isinstance(sample_val, bool):
-            t = "boolean"
-        elif isinstance(sample_val, int):
-            t = "integer"
-        elif isinstance(sample_val, float):
-            t = "numeric"
-        else:
-            t = "text"
-        lines.append(f"- {c}: {t}")
-    return "\n".join(lines) + "\n"
+def _db_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail="Dataset database is not configured or unreachable.")
 
 
-def get_table_schema_text(table_name: str, rows_hint: List[Dict[str, Any]] = None, explicit_schema_text: str = None) -> str:
-    """Resolve a usable NL→SQL schema string. Priority: explicit → DB probe → mock dtype inference."""
-    if explicit_schema_text:
-        return explicit_schema_text
-    if not use_mock_db and engine is not None:
-        try:
-            q = text(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = :t ORDER BY ordinal_position")
-            with engine.connect() as conn:
-                schema_result = conn.execute(q, {"t": table_name}).fetchall()
-            if schema_result:
-                lines = [f"Table: {table_name}", "Columns:"]
-                for row in schema_result:
-                    lines.append(f"- {row[0]}: {row[1]}")
-                return "\n".join(lines) + "\n"
-        except Exception as e:
-            logger.warning(f"information_schema lookup failed: {e}")
-    return _build_mock_schema_text(table_name, rows_hint)
+def _read_upload_limits(content: bytes, filename: str) -> None:
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file uploaded.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.")
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
 
-def execute_sql_query(sql: str, table_name: str = None):
-    """Execute SQL query with fallback to mock data.
-
-    Raises exception on real-DB errors so the retry/correction loop can capture them.
-    Only returns mock silently in use_mock_db=True mode (Supabase unreachable).
-    """
-    if use_mock_db:
-        if "SELECT" in sql.upper():
-            rows = get_mock_data(table_name or "66367cec-9204-4405-90ce-ef5150209ccd")
-            logger.info(f"[mock_db] returning {len(rows)} rows for table={table_name}")
-            return rows
-        return []
-    with engine.connect() as conn:
-        result = conn.execute(text(sql))
-        rows = result.fetchall()
-        columns = result.keys()
-        return [dict(zip(columns, row)) for row in rows]
+def _load_and_check(content: bytes):
+    df, mapping = load_csv_dataframe(content)
+    if len(df) == 0:
+        raise HTTPException(status_code=400, detail="CSV contains headers but no data rows.")
+    if len(df) > MAX_CSV_ROWS:
+        raise HTTPException(status_code=413, detail=f"CSV has more than {MAX_CSV_ROWS} rows.")
+    if df.shape[1] > MAX_CSV_COLUMNS:
+        raise HTTPException(status_code=413, detail=f"CSV has more than {MAX_CSV_COLUMNS} columns.")
+    return df, mapping
 
 
 # ============================================================
 # API Endpoints
 # ============================================================
-@app.post("/query", response_model=QueryResponse)
-async def process_natural_language_query(request: QueryRequest):
-    """Convert natural language to SQL using Hugging Face with auto-error fixing."""
-    start_total = time.time()
+@app.post("/ingest", response_model=DatasetProcessingResponse, dependencies=[Depends(require_internal_token)])
+async def ingest_dataset(
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+):
+    """Profile a CSV and load it into PostgreSQL as the dataset's own table."""
     try:
-        logger.info(f"Processing query: {request.user_query} for table: {request.table_name}")
+        table_name = data_store.table_name_for_dataset(dataset_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="dataset_id must be a UUID.")
 
-        schema_used = get_table_schema_text(request.table_name, explicit_schema_text=request.table_schema_text)
-        logger.info(f"Schema ({len(schema_used.splitlines())} lines):\n{schema_used}")
+    filename = file.filename or "upload.csv"
+    content = await file.read()
+    _read_upload_limits(content, filename)
 
-        # Step 1: Generate SQL
+    try:
+        df, mapping = await run_in_threadpool(_load_and_check, content)
+        profile = await run_in_threadpool(profile_dataframe, df, filename, table_name, mapping)
+        await run_in_threadpool(data_store.ingest_dataframe, df, table_name)
+    except HTTPException:
+        raise
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="CSV file contains no data or unparseable content.")
+    except pd.errors.ParserError as e:
+        raise HTTPException(status_code=400, detail=f"CSV could not be parsed: {str(e)[:200]}")
+    except data_store.DatabaseNotConfigured:
+        raise _db_unavailable()
+    except Exception as e:  # noqa: BLE001
+        logger.error("/ingest failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Could not store dataset: {type(e).__name__}")
+
+    logger.info("Ingested %s -> %s (%s rows x %s cols)", filename, table_name, profile["row_count"], profile["column_count"])
+    return DatasetProcessingResponse(**profile)
+
+
+@app.delete("/datasets/{table_name}", dependencies=[Depends(require_internal_token)])
+async def delete_dataset_table(table_name: str):
+    _require_valid_table(table_name)
+    try:
+        await run_in_threadpool(data_store.drop_dataset_table, table_name)
+    except data_store.DatabaseNotConfigured:
+        raise _db_unavailable()
+    except Exception as e:  # noqa: BLE001
+        logger.error("drop table failed: %s", e)
+        raise HTTPException(status_code=502, detail="Could not drop dataset table.")
+    return {"dropped": table_name}
+
+
+@app.post("/process-data", response_model=DatasetProcessingResponse, dependencies=[Depends(require_internal_token)])
+async def process_data(file: UploadFile = File(...), table_name: Optional[str] = Form(None)):
+    """Profile an uploaded CSV with deterministic pandas logic (does not store anything)."""
+    filename = file.filename or "upload.csv"
+    content = await file.read()
+    _read_upload_limits(content, filename)
+    try:
+        profile = await run_in_threadpool(process_uploaded_csv, content, filename, table_name)
+        return DatasetProcessingResponse(**profile)
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="CSV file contains no data or unparseable content.")
+    except Exception as e:  # noqa: BLE001
+        logger.error("/process-data error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing CSV: {type(e).__name__}")
+
+
+@app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_internal_token)])
+async def process_natural_language_query(request: QueryRequest):
+    """Natural language -> validated read-only SQL -> results, chart, insights, recommendations."""
+    start_total = time.time()
+    _require_valid_table(request.table_name)
+    table = request.table_name
+    logger.info("query user=%s table=%s q=%r", request.user_id, table, request.user_query[:200])
+
+    try:
+        schema_used = request.table_schema_text
+        if not schema_used or f"Table: {table}" not in schema_used:
+            schema_used = await run_in_threadpool(data_store.describe_table, table)
+        if not schema_used:
+            raise HTTPException(status_code=404, detail="Dataset table not found. Re-upload the dataset.")
+
         sql_query, sql_gen_meta = await generate_sql_from_query(request.user_query, schema_used)
         if not sql_query:
-            sql_query = f"SELECT * FROM {request.table_name} LIMIT 10;"
-        logger.info(f"Generated SQL: {sql_query}  (meta.path_used={sql_gen_meta.get('path_used')})")
+            sql_query = f"SELECT * FROM {table} LIMIT 10"
 
-        # Step 2: Execute SQL with retry + correction loop (max 2 correction attempts = 3 total runs)
         max_corrections = 2
         current_sql = sql_query
         correction_meta_log: List[Dict[str, Any]] = []
         correction_attempts = 0
-        results = []
+        results: List[Dict[str, Any]] = []
+        truncated = False
         execution_time = 0.0
-        sql_error = None
+        sql_error: Optional[str] = None
+        used_fallback_preview = False
+        warnings: List[str] = []
 
         for attempt in range(max_corrections + 1):
             try:
                 t0 = time.time()
-                results = execute_sql_query(current_sql, request.table_name)
+                results, truncated, current_sql = await run_in_threadpool(
+                    data_store.run_readonly_query, current_sql, table
+                )
                 execution_time = time.time() - t0
-                logger.info(f"Query executed (attempt {attempt+1}), returned {len(results)} rows")
                 sql_error = None
                 break
-            except Exception as e:
+            except data_store.DatabaseNotConfigured:
+                raise _db_unavailable()
+            except (UnsafeSQLError, data_store.QueryExecutionError) as e:
                 sql_error = str(e)
-                logger.error(f"SQL execution error (attempt {attempt + 1}): {sql_error}")
+                logger.warning("SQL attempt %s failed (%s): %s", attempt + 1, type(e).__name__, sql_error)
                 if attempt < max_corrections:
                     corrected, c_meta = await fix_sql_error(current_sql, sql_error, schema_used)
-                    correction_meta_log.append({**c_meta, "original_sql": current_sql[:200], "error": sql_error[:200], "corrected_sql": (corrected or "")[:200]})
+                    correction_meta_log.append({
+                        **c_meta,
+                        "original_sql": current_sql[:200],
+                        "error": sql_error[:200],
+                        "corrected_sql": (corrected or "")[:200],
+                    })
                     correction_attempts += 1
-                    if corrected:
-                        logger.info(f"Corrected SQL (via {c_meta.get('path_used')}): {corrected}")
-                        current_sql = corrected
-                    else:
-                        # LLM correction unavailable → try safe fallback
-                        current_sql = f"SELECT * FROM {request.table_name} LIMIT 10;"
+                    current_sql = corrected or f"SELECT * FROM {table} LIMIT 10"
                 else:
-                    # Final attempt → fall back to mock preview
-                    current_sql = f"SELECT * FROM {request.table_name} LIMIT 10;"
-                    try:
-                        t0 = time.time()
-                        results = execute_sql_query(current_sql, request.table_name)
-                        execution_time = time.time() - t0
-                    except Exception as fe:
-                        logger.error(f"Fallback preview SQL also failed: {fe}")
-                        results = []
-                        execution_time = time.time() - start_total
+                    current_sql = f"SELECT * FROM {table} LIMIT 10"
 
-        # Step 3: Auto chart detection
+        if sql_error is not None:
+            # Every generated query failed; show a clearly-labelled preview instead of a wrong answer.
+            try:
+                t0 = time.time()
+                results, truncated, current_sql = await run_in_threadpool(
+                    data_store.run_readonly_query, f"SELECT * FROM {table} LIMIT 10", table
+                )
+                execution_time = time.time() - t0
+                used_fallback_preview = True
+                warnings.append(
+                    "Your question could not be turned into a valid query, so the first 10 rows are shown instead. "
+                    f"Last error: {sql_error[:160]}"
+                )
+            except Exception as fe:  # noqa: BLE001
+                logger.error("Fallback preview failed: %s", fe)
+                raise HTTPException(status_code=502, detail="Query failed and dataset preview is unavailable.")
+
+        if truncated:
+            warnings.append(f"Result truncated to {data_store.MAX_RESULT_ROWS} rows.")
+
         if results:
-            df = pd.DataFrame(results)
-            # Convert object columns that look like dates to datetime (for chart detection accuracy)
-            for col in df.columns:
-                if pd.api.types.is_object_dtype(df[col]):
-                    try:
-                        parsed = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
-                        if parsed.notna().sum() >= max(1, int(0.7 * len(df))):
-                            df[col] = parsed
-                    except Exception:
-                        pass
+            df = _maybe_parse_dates(pd.DataFrame(results))
             chart_config = detect_chart_type(df)
         else:
             chart_config = {"chart_type": "table", "title": "No Data"}
 
-        # Step 4: Insights (returns tuple)
         insights_data, insights_meta = await generate_insights_from_data(results, request.user_query)
-
-        # Step 5: Recommendations (returns tuple)
         structured_recs, recs_meta = await generate_recommendations_from_insights(insights_data)
         flat_recommendations = flatten_recommendations(structured_recs)
 
-        elapsed_total = time.time() - start_total
-
-        # If the SQL execution path ended with a soft-fallback error, bake it into insights
-        if sql_error and len(results) == 0 and not any(i.get("type") == "dataset_overview" for i in insights_data.get("insights", [])):
+        if used_fallback_preview:
             insights_data.setdefault("insights", []).append({
                 "type": "data_quality",
-                "description": f"Query execution error (used fallback preview): {sql_error[:200]}"
+                "description": f"Query could not be executed; showing a preview instead. Reason: {(sql_error or '')[:200]}",
             })
 
         return QueryResponse(
@@ -360,82 +387,65 @@ async def process_natural_language_query(request: QueryRequest):
             recommendations_meta=recs_meta,
             chart_type=chart_config.get("chart_type", "table"),
             schema_used=schema_used,
+            warnings=warnings,
+            used_fallback_preview=used_fallback_preview,
+            truncated=truncated,
         )
 
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}", exc_info=True)
-        error_insights = {
-            "insights": [{"type": "dataset_overview", "description": f"Error occurred: {str(e)[:300]}"}],
-            "trends": [],
-            "anomalies": []
-        }
-        error_recs = flatten_recommendations(
-            generate_fallback_recommendations_structured(error_insights, extract_insights_text(error_insights))
-        ) or ["Please try again or contact support."]
-        fallback_meta = {
-            "path_used": "rule_fallback",
-            "llm_success": False,
-            "model": "mistralai/Mistral-7B-Instruct-v0.1",
-            "fallback_reason": f"top_level_exception: {type(e).__name__}",
-            "raw_response_excerpt": None
-        }
-        return QueryResponse(
-            sql_query="SELECT * FROM table LIMIT 10;",
-            data=[],
-            chart={"chart_type": "table", "title": "Error"},
-            insights=error_insights,
-            recommendations=error_recs,
-            execution_time=round(time.time() - start_total, 4),
-            row_count=0,
-            sql_generation_meta=fallback_meta,
-            sql_correction_attempts=0,
-            sql_correction_meta=[],
-            insights_meta=fallback_meta,
-            recommendations_meta=fallback_meta,
-            chart_type="table",
-            schema_used="",
-        )
+    except HTTPException:
+        raise
+    except data_store.DatabaseNotConfigured:
+        raise _db_unavailable()
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error processing query: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Query processing failed.")
 
 
-@app.post("/generate-insights", response_model=InsightResponse)
+@app.post("/generate-insights", response_model=InsightResponse, dependencies=[Depends(require_internal_token)])
 async def generate_dataset_insights(request: InsightRequest):
-    """Generate insights from dataset (returns tuple with path metadata)."""
+    """Generate insights from supplied rows, or from the dataset table (first 1000 rows)."""
     try:
         if request.query_results:
-            data = request.query_results
-        elif use_mock_db:
-            data = get_mock_data(request.table_name)
+            data = request.query_results[:MAX_INSIGHT_INPUT_ROWS]
         else:
-            data = execute_sql_query(f"SELECT * FROM {request.table_name} LIMIT 1000", request.table_name)
+            _require_valid_table(request.table_name)
+            data, _, _ = await run_in_threadpool(
+                data_store.run_readonly_query, f"SELECT * FROM {request.table_name} LIMIT 1000", request.table_name
+            )
 
         if not data:
             empty_meta = {
-                "path_used": "rule_fallback", "llm_success": False,
-                "model": "mistralai/Mistral-7B-Instruct-v0.1",
-                "fallback_reason": "empty_dataset"
+                "path_used": "rule_fallback",
+                "llm_success": False,
+                "model": None,
+                "fallback_reason": "empty_dataset",
             }
             return InsightResponse(
                 insights=[{"type": "dataset_overview", "description": "No data available for analysis"}],
-                trends=[], anomalies=[], meta=empty_meta
+                trends=[], anomalies=[], meta=empty_meta,
             )
 
-        insights_data, meta = await generate_insights_from_data(data, f"Generate insights about table {request.table_name}")
-
+        insights_data, meta = await generate_insights_from_data(data, "Generate insights about this dataset")
         return InsightResponse(
             insights=insights_data.get("insights", []),
             trends=insights_data.get("trends", []),
             anomalies=insights_data.get("anomalies", []),
             meta=meta,
         )
+    except HTTPException:
+        raise
+    except data_store.DatabaseNotConfigured:
+        raise _db_unavailable()
+    except (UnsafeSQLError, data_store.QueryExecutionError) as e:
+        raise HTTPException(status_code=422, detail=f"Could not read dataset: {str(e)[:200]}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error generating insights: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Error generating insights.")
 
-    except Exception as e:
-        logger.error(f"Error generating insights: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error generating insights: {str(e)}")
 
-
-@app.post("/recommendations", response_model=RecommendationResponse)
+@app.post("/recommendations", response_model=RecommendationResponse, dependencies=[Depends(require_internal_token)])
 async def generate_business_recommendations(request: RecommendationRequest):
-    """Generate business recommendations based on insights (structured output + meta evidence)."""
+    """Generate business recommendations from insights."""
     try:
         insights_payload = request.insights
         if isinstance(insights_payload, list):
@@ -458,71 +468,41 @@ async def generate_business_recommendations(request: RecommendationRequest):
                     items=rec.get("items", []),
                 ))
             elif isinstance(rec, str):
-                rec_items.append(RecommendationItem(
-                    category="General", icon="target", items=[rec]
-                ))
+                rec_items.append(RecommendationItem(category="General", icon="target", items=[rec]))
 
         return RecommendationResponse(
             recommendations=rec_items,
             action_items=structured.get("action_items", []) or [],
             meta=meta,
         )
-
-    except Exception as e:
-        logger.error(f"Error generating recommendations: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
-
-
-@app.post("/process-data", response_model=DatasetProcessingResponse)
-async def process_data(
-    file: UploadFile = File(...),
-    table_name: Optional[str] = Form(None),
-):
-    """Analyze an uploaded CSV with deterministic pandas profiling.
-
-    The returned `schema_text` field is directly usable as the `table_schema_text`
-    parameter of POST /query to restrict the NL→SQL model to real columns only.
-    """
-    try:
-        filename = file.filename or "upload.csv"
-        content = await file.read()
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded.")
-        if not filename.lower().endswith(".csv"):
-            raise HTTPException(status_code=400, detail="Only CSV files are supported.")
-
-        logger.info(f"Processing CSV upload: {filename} ({len(content)} bytes)")
-        profile = process_uploaded_csv(content, filename=filename, table_name=table_name)
-        logger.info(f"CSV profile complete: {profile['row_count']} rows x {profile['column_count']} cols; table={profile['table_name']}")
-
-        return DatasetProcessingResponse(**profile)
-
-    except HTTPException:
-        raise
-    except pd.errors.EmptyDataError:
-        raise HTTPException(status_code=400, detail="CSV file contains no data or unparseable content.")
-    except Exception as e:
-        logger.error(f"/process-data error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing CSV: {type(e).__name__}: {str(e)[:300]}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error generating recommendations: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Error generating recommendations.")
 
 
 @app.get("/")
 async def root():
-    return {"message": "AI Data Analyst Service is running", "status": "healthy", "llm_model": "mistralai/Mistral-7B-Instruct-v0.1", "llm_provider": "huggingface"}
+    return {"message": "AI Data Analyst Service is running", "status": "healthy"}
 
 
 @app.get("/health")
 async def health_check():
+    from llm_utils import HuggingFaceLLM, llm
+
+    db_status = await run_in_threadpool(data_store.database_status)
     return {
-        "status": "healthy",
-        "database": "connected" if not use_mock_db else "mock",
-        "llm_model": "mistralai/Mistral-7B-Instruct-v0.1",
+        "status": "healthy" if db_status == "connected" else "degraded",
+        "database": db_status,
+        "llm_model": HuggingFaceLLM.ACTIVE_MODEL,
         "llm_provider": "huggingface",
-        "version": "1.2.0",
+        "llm_configured": llm.configured,
+        "version": app.version,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("AI_SERVICE_PORT", 8001))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Bind to localhost by default: only the Node backend should reach this service.
+    uvicorn.run(app, host=os.getenv("AI_SERVICE_HOST", "127.0.0.1"), port=port)

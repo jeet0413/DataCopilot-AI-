@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Send, Bot, User, Sparkles } from 'lucide-react';
 
-const ChatBox = () => {
+const ChatBox = ({ onQuerySubmit, placeholder = 'Ask about your data...' }) => {
   const [messages, setMessages] = useState([
     {
       id: 1,
@@ -36,17 +36,37 @@ const ChatBox = () => {
     setInput('');
     setIsTyping(true);
 
-    // Simulate AI response
-    setTimeout(() => {
-      const botMessage = {
-        id: messages.length + 2,
-        type: 'bot',
-        content: 'I\'ve analyzed your query. Based on your sales data, I can see that revenue has increased by 23% over the last quarter. The top performing product category is Electronics with $45,000 in sales. Would you like me to create a visualization for this data?',
-        timestamp: new Date().toLocaleTimeString()
-      };
-      setMessages(prev => [...prev, botMessage]);
-      setIsTyping(false);
-    }, 1500);
+    const question = userMessage.content;
+    let content;
+    try {
+      const result = onQuerySubmit ? await onQuerySubmit(question) : null;
+      if (!result) {
+        content = 'Please select a dataset first, then ask your question again.';
+      } else if (result.error) {
+        content = `Sorry, I couldn't answer that: ${result.error}`;
+      } else {
+        const rows = result.data || [];
+        const lines = [`I ran this query and got ${rows.length} row${rows.length === 1 ? '' : 's'}:`, result.sql_query];
+        if (rows.length === 1) {
+          lines.push(Object.entries(rows[0]).map(([k, v]) => `${k}: ${v}`).join(', '));
+        }
+        (result.warnings || []).forEach((w) => lines.push(`Note: ${w}`));
+        const top = result.insights && result.insights.insights && result.insights.insights[0];
+        if (top && top.description) lines.push(top.description);
+        lines.push('See the Results, Chart and Insights tabs for details.');
+        content = lines.join('\n\n');
+      }
+    } catch (error) {
+      content = `Sorry, something went wrong: ${error.message}`;
+    }
+
+    setMessages(prev => [...prev, {
+      id: Date.now(),
+      type: 'bot',
+      content,
+      timestamp: new Date().toLocaleTimeString()
+    }]);
+    setIsTyping(false);
   };
 
   const handleKeyPress = (e) => {
@@ -88,7 +108,7 @@ const ChatBox = () => {
                   : 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white'
               }`}
             >
-              <p className="text-sm">{message.content}</p>
+              <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
               <p className="text-xs mt-1 opacity-70">{message.timestamp}</p>
             </div>
 
@@ -124,7 +144,7 @@ const ChatBox = () => {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyPress={handleKeyPress}
-            placeholder="Ask about your data..."
+            placeholder={placeholder}
             className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
           />
           <button

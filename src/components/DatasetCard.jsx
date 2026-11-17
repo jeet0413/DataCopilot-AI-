@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import PropTypes from 'prop-types';
 import { Database, Eye, Download, MoreVertical, Calendar, X } from 'lucide-react';
 
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3002/api';
+
 const DatasetCard = ({ dataset, onDelete }) => {
   const { name, file_path, file_size, created_at, id } = dataset;
   const [showActions, setShowActions] = useState(false);
@@ -43,7 +45,7 @@ const DatasetCard = ({ dataset, onDelete }) => {
     try {
       // Fetch the dataset content from download endpoint
       const token = localStorage.getItem('authToken');
-      const downloadUrl = `http://localhost:3002/api/download/${id}`;
+      const downloadUrl = `${API_BASE_URL}/download/${id}`;
       
       const response = await fetch(downloadUrl, {
         method: 'GET',
@@ -100,7 +102,7 @@ const DatasetCard = ({ dataset, onDelete }) => {
       console.log('Starting download for dataset:', { id, name, file_path });
       
       // Create a proper download URL
-      const downloadUrl = `http://localhost:3002/api/download/${id}`;
+      const downloadUrl = `${API_BASE_URL}/download/${id}`;
       console.log('Download URL:', downloadUrl);
       
       // Get auth token

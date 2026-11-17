@@ -6,59 +6,25 @@ import SkeletonLoader from '../components/SkeletonLoader';
 import EmptyState from '../components/EmptyState';
 import { fetchDatasets, deleteDataset } from '../services/api';
 
-const stats = [
-  {
-    title: 'Total Datasets',
-    value: '12',
-    icon: Database,
-    change: '+2',
-    changeType: 'positive'
-  },
-  {
-    title: 'Total Rows',
-    value: '28.4K',
-    icon: TrendingUp,
-    change: '+23%',
-    changeType: 'positive'
-  },
-  {
-    title: 'Active Users',
-    value: '1,234',
-    icon: Users,
-    change: '+12%',
-    changeType: 'positive'
-  },
-  {
-    title: 'Storage Used',
-    value: '5.9 GB',
-    icon: DollarSign,
-    change: '+8%',
-    changeType: 'positive'
-  }
-];
+const formatCount = (n) => {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n);
+};
 
-const recentInsights = [
-  {
-    id: 1,
-    title: 'Sales Spike Detected',
-    description: 'Electronics category shows 45% increase in weekly sales',
-    time: '2 hours ago',
-    type: 'success'
-  },
-  {
-    id: 2,
-    title: 'Customer Churn Alert',
-    description: '15% increase in customer churn rate this month',
-    time: '5 hours ago',
-    type: 'warning'
-  },
-  {
-    id: 3,
-    title: 'Inventory Optimization',
-    description: 'AI suggests reducing stock for low-performing products',
-    time: '1 day ago',
-    type: 'info'
-  }
+const formatBytes = (bytes) => {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${Math.round((bytes / Math.pow(1024, i)) * 10) / 10} ${units[i]}`;
+};
+
+// All figures are computed from the user's real datasets.
+const buildStats = (datasets) => [
+  { title: 'Total Datasets', value: String(datasets.length), icon: Database },
+  { title: 'Total Rows', value: formatCount(datasets.reduce((n, d) => n + (d.row_count || 0), 0)), icon: TrendingUp },
+  { title: 'Total Columns', value: formatCount(datasets.reduce((n, d) => n + (d.column_count || 0), 0)), icon: Users },
+  { title: 'Storage Used', value: formatBytes(datasets.reduce((n, d) => n + (d.file_size || 0), 0)), icon: DollarSign },
 ];
 
 const Dashboard = () => {
@@ -146,7 +112,7 @@ const Dashboard = () => {
             <SkeletonLoader key={index} type="kpi" />
           ))
         ) : (
-          stats.map((stat, index) => {
+          buildStats(datasets).map((stat, index) => {
             const Icon = stat.icon;
             return (
               <div key={index} className="card p-6 hover:shadow-md transform hover:-translate-y-1 transition-all duration-300">
@@ -154,13 +120,6 @@ const Dashboard = () => {
                   <div className="p-2 bg-primary-100 dark:bg-primary-900/30 rounded-lg">
                     <Icon className="w-6 h-6 text-primary-600 dark:text-primary-400" />
                   </div>
-                  <span className={`text-sm font-medium ${
-                    stat.changeType === 'positive' 
-                      ? 'text-green-600 dark:text-green-400' 
-                      : 'text-red-600 dark:text-red-400'
-                  }`}>
-                    {stat.change}
-                  </span>
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-gray-900 dark:text-white">
@@ -220,30 +179,21 @@ const Dashboard = () => {
             Recent Insights
           </h2>
           <div className="space-y-3">
-            {recentInsights.map((insight) => (
-              <div
-                key={insight.id}
-                className="card p-4 hover:shadow-md transition-shadow duration-200"
-              >
-                <div className="flex items-start space-x-3">
-                  <div className={`w-2 h-2 rounded-full mt-2 ${
-                    insight.type === 'success' ? 'bg-green-500' :
-                    insight.type === 'warning' ? 'bg-yellow-500' : 'bg-blue-500'
-                  }`} />
-                  <div className="flex-1">
-                    <h4 className="font-medium text-gray-900 dark:text-white text-sm">
-                      {insight.title}
-                    </h4>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                      {insight.description}
-                    </p>
-                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-2">
-                      {insight.time}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ))}
+            <div className="card p-4">
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                {datasets.length === 0
+                  ? 'Upload a dataset to start getting AI-generated insights.'
+                  : 'Insights are generated from your data on demand.'}
+              </p>
+              {datasets.length > 0 && (
+                <Link
+                  to="/insights"
+                  className="inline-block mt-2 text-primary-600 hover:text-primary-700 dark:text-primary-400 text-sm font-medium"
+                >
+                  Generate insights
+                </Link>
+              )}
+            </div>
           </div>
         </div>
       </div>
