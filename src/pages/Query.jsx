@@ -563,6 +563,22 @@ const Query = () => {
 
               {/* Tab Content */}
               <div className="p-6">
+                {queryResult && activeTab !== 'chat' && (
+                  <div className="mb-4 space-y-2">
+                    {(queryResult.warnings || []).map((w, i) => (
+                      <div key={i} className="flex items-start gap-2 p-3 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 text-sm text-yellow-800 dark:text-yellow-200">
+                        <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                        <span>{w}</span>
+                      </div>
+                    ))}
+                    {queryResult.sql_query && (
+                      <details className="text-sm text-gray-600 dark:text-gray-300">
+                        <summary className="cursor-pointer">SQL that was run</summary>
+                        <pre className="mt-2 p-3 bg-gray-100 dark:bg-gray-900 rounded overflow-x-auto whitespace-pre-wrap break-words">{queryResult.sql_query}</pre>
+                      </details>
+                    )}
+                  </div>
+                )}
                 {activeTab === 'chat' ? (
                   <ChatBox
                     onQuerySubmit={handleQuerySubmit}
